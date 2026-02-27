@@ -22,23 +22,41 @@ using socklen_t = int;
 #include <map>
 #include <vector>
 
-#include "../include/protocol.h"
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 #define PORT 5000
+#define MAX_UDP_PAYLOAD 1400
 
-int init_udp_socket(int port) {
+enum PacketType : uint8_t { EXTRADATA = 0, FRAME = 1 };
+
+struct FrameBuffer {
+  std::vector<uint8_t> data;
+  size_t total_chunks = 0;
+  size_t received_chunks = 0;
+  size_t actual_size = 0;
+  std::chrono::steady_clock::time_point last_updated;
+};
+
+struct NetworkContext {
+  int sock = -1;
+};
+
+bool setup_network(int port, NetworkContext &net_ctx) {
 #ifdef _WIN32
   WSADATA wsaData;
   if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
     std::cerr << "WSAStartup failed.\n";
-    return -1;
+    return false;
   }
 #endif
 
-  int sock = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sock < 0) {
+  net_ctx.sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (net_ctx.sock < 0) {
     perror("socket");
-    return -1;
+    return false;
   }
 
   sockaddr_in addr{};
@@ -46,124 +64,141 @@ int init_udp_socket(int port) {
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = INADDR_ANY;
   int opt = 1;
-  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+  setsockopt(net_ctx.sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt,
+             sizeof(opt));
 
   int rcvbuf = 1048576 * 10; // 10MB
-  setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf,
+  setsockopt(net_ctx.sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf,
              sizeof(rcvbuf));
 
 #ifdef _WIN32
   u_long mode = 1; // non-blocking socket
-  ioctlsocket(sock, FIONBIO, &mode);
+  ioctlsocket(net_ctx.sock, FIONBIO, &mode);
 #endif
 
-  if (bind(sock, (sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (bind(net_ctx.sock, (sockaddr *)&addr, sizeof(addr)) < 0) {
     perror("bind");
-#ifdef _WIN32
-    closesocket(sock);
-    WSACleanup();
-#else
-    close(sock);
-#endif
-    return -1;
+    return false;
   }
-  return sock;
+  return true;
 }
 
-AVCodecContext *init_decoder(AVBufferRef **hw_device_ctx) {
-  if (av_hwdevice_ctx_create(hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr,
-                             nullptr, 0) < 0) {
+void cleanup_network(NetworkContext &net_ctx) {
+#ifdef _WIN32
+  if (net_ctx.sock >= 0)
+    closesocket(net_ctx.sock);
+  WSACleanup();
+#else
+  if (net_ctx.sock >= 0)
+    close(net_ctx.sock);
+#endif
+}
+
+struct DecoderContext {
+  AVBufferRef *hw_device_ctx = nullptr;
+  AVCodecContext *ctx = nullptr;
+};
+
+bool setup_decoder(DecoderContext &dec_ctx) {
+  if (av_hwdevice_ctx_create(&dec_ctx.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA,
+                             nullptr, nullptr, 0) < 0) {
     std::cerr << "Warning: Failed to create CUDA hardware context. Falling "
                  "back to software decoding.\n";
-    *hw_device_ctx = nullptr;
+    dec_ctx.hw_device_ctx = nullptr;
   }
 
   const AVCodec *codec = avcodec_find_decoder_by_name("av1");
   if (!codec) {
     std::cerr << "AV1 decoder not found.\n";
-    return nullptr;
+    return false;
   }
 
-  AVCodecContext *ctx = avcodec_alloc_context3(codec);
-  if (!ctx)
-    return nullptr;
+  dec_ctx.ctx = avcodec_alloc_context3(codec);
+  if (!dec_ctx.ctx)
+    return false;
 
-  ctx->hw_device_ctx = *hw_device_ctx ? av_buffer_ref(*hw_device_ctx) : nullptr;
+  dec_ctx.ctx->hw_device_ctx =
+      dec_ctx.hw_device_ctx ? av_buffer_ref(dec_ctx.hw_device_ctx) : nullptr;
 
-  if (avcodec_open2(ctx, codec, nullptr) < 0) {
+  if (avcodec_open2(dec_ctx.ctx, codec, nullptr) < 0) {
     std::cerr << "Failed to open AV1 decoder\n";
-    avcodec_free_context(&ctx);
-    return nullptr;
+    return false;
   }
-  return ctx;
+  return true;
 }
 
-bool init_sdl_window(SDL_Window **window, SDL_Renderer **renderer) {
+void cleanup_decoder(DecoderContext &dec_ctx) {
+  if (dec_ctx.ctx)
+    avcodec_free_context(&dec_ctx.ctx);
+  if (dec_ctx.hw_device_ctx)
+    av_buffer_unref(&dec_ctx.hw_device_ctx);
+}
+
+struct DisplayContext {
+  SDL_Window *window = nullptr;
+  SDL_Renderer *renderer = nullptr;
+  SDL_Texture *texture = nullptr;
+};
+
+bool setup_display(DisplayContext &disp_ctx) {
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     std::cerr << "SDL_Init Error: " << SDL_GetError() << "\n";
     return false;
   }
 
-  *window = SDL_CreateWindow("4K120 Multiplexer Stream", 1920, 1080,
-                             SDL_WINDOW_RESIZABLE);
-  if (!*window) {
+  disp_ctx.window = SDL_CreateWindow("4K120 Multiplexer Stream", 1920, 1080,
+                                     SDL_WINDOW_RESIZABLE);
+  if (!disp_ctx.window) {
     std::cerr << "SDL_CreateWindow Error: " << SDL_GetError() << "\n";
     return false;
   }
 
-  *renderer = SDL_CreateRenderer(*window, nullptr);
-  if (!*renderer) {
+  disp_ctx.renderer = SDL_CreateRenderer(disp_ctx.window, nullptr);
+  if (!disp_ctx.renderer) {
     std::cerr << "SDL_CreateRenderer Error: " << SDL_GetError() << "\n";
     return false;
   }
   return true;
 }
 
-int main(int argc, char *argv[]) {
-  int port = PORT;
-  if (argc > 1) {
-    port = std::atoi(argv[1]);
-  }
+void cleanup_display(DisplayContext &disp_ctx) {
+  if (disp_ctx.texture)
+    SDL_DestroyTexture(disp_ctx.texture);
+  if (disp_ctx.renderer)
+    SDL_DestroyRenderer(disp_ctx.renderer);
+  if (disp_ctx.window)
+    SDL_DestroyWindow(disp_ctx.window);
+  SDL_Quit();
+}
 
-  int sock = init_udp_socket(port);
-  if (sock < 0)
-    return 1;
-
-  AVBufferRef *hw_device_ctx = nullptr;
-  AVCodecContext *ctx = init_decoder(&hw_device_ctx);
-  if (!ctx)
-    return 1;
-
-  SDL_Window *window = nullptr;
-  SDL_Renderer *renderer = nullptr;
-  if (!init_sdl_window(&window, &renderer))
-    return 1;
-
-  SDL_Texture *texture = nullptr;
-
-  AVFrame *frame = av_frame_alloc();
-  AVFrame *sw_frame = av_frame_alloc();
-  AVPacket *pkt = av_packet_alloc();
+struct StreamState {
+  bool quit = false;
+  bool first_recv = true;
+  uint32_t expected_frame_id = 0;
+  uint32_t dropped_frames = 0;
+  uint32_t frames_rendered = 0;
+  std::chrono::steady_clock::time_point stat_start_time;
 
   std::vector<uint8_t> extradata_buffer;
   std::map<uint32_t, FrameBuffer> frames;
 
-  std::cout << "Client listening on port " << port << " for 4K stream...\n";
+  AVFrame *frame = nullptr;
+  AVFrame *sw_frame = nullptr;
+  AVPacket *pkt = nullptr;
+};
 
-  bool quit = false;
-  bool first_recv = true;
+void run_client_loop(NetworkContext &net_ctx, DecoderContext &dec_ctx,
+                     DisplayContext &disp_ctx, StreamState &state) {
+  state.frame = av_frame_alloc();
+  state.sw_frame = av_frame_alloc();
+  state.pkt = av_packet_alloc();
+  state.stat_start_time = std::chrono::steady_clock::now();
 
-  // Performance tracking
-  uint32_t expected_frame_id = 0;
-  uint32_t dropped_frames = 0;
-  uint32_t frames_rendered = 0;
-  auto stat_start_time = std::chrono::steady_clock::now();
-
-  while (!quit) {
+  while (!state.quit) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
       if (e.type == SDL_EVENT_QUIT) {
-        quit = true;
+        state.quit = true;
       }
     }
 
@@ -171,12 +206,11 @@ int main(int argc, char *argv[]) {
     sockaddr_in sender{};
     socklen_t sender_len = sizeof(sender);
 
-    // Non-blocking socket
 #ifdef _WIN32
-    ssize_t n = recvfrom(sock, (char *)buf, sizeof(buf), 0, (sockaddr *)&sender,
-                         &sender_len);
+    ssize_t n = recvfrom(net_ctx.sock, (char *)buf, sizeof(buf), 0,
+                         (sockaddr *)&sender, &sender_len);
 #else
-    ssize_t n = recvfrom(sock, buf, sizeof(buf), MSG_DONTWAIT,
+    ssize_t n = recvfrom(net_ctx.sock, buf, sizeof(buf), MSG_DONTWAIT,
                          (sockaddr *)&sender, &sender_len);
 #endif
 
@@ -186,36 +220,37 @@ int main(int argc, char *argv[]) {
       uint16_t packet_id = ntohs(*((uint16_t *)(buf + 5)));
       uint16_t total_packets = ntohs(*((uint16_t *)(buf + 7)));
 
-      if (frame_id > expected_frame_id && type == FRAME) {
-        dropped_frames += (frame_id - expected_frame_id);
-        expected_frame_id = frame_id; // Sync to current
+      if (frame_id > state.expected_frame_id && type == FRAME) {
+        state.dropped_frames += (frame_id - state.expected_frame_id);
+        state.expected_frame_id = frame_id;
       }
 
       if (type == EXTRADATA) {
-        if (extradata_buffer.size() < total_packets * MAX_UDP_PAYLOAD)
-          extradata_buffer.resize(total_packets * MAX_UDP_PAYLOAD);
-        memcpy(extradata_buffer.data() + packet_id * MAX_UDP_PAYLOAD, buf + 9,
-               n - 9);
+        if (state.extradata_buffer.size() < total_packets * MAX_UDP_PAYLOAD)
+          state.extradata_buffer.resize(total_packets * MAX_UDP_PAYLOAD);
+        memcpy(state.extradata_buffer.data() + packet_id * MAX_UDP_PAYLOAD,
+               buf + 9, n - 9);
 
         if (packet_id + 1 == total_packets) {
-          if (ctx->extradata)
-            av_freep(&ctx->extradata);
-          ctx->extradata_size = extradata_buffer.size();
-          ctx->extradata = (uint8_t *)av_mallocz(ctx->extradata_size +
-                                                 AV_INPUT_BUFFER_PADDING_SIZE);
-          memcpy(ctx->extradata, extradata_buffer.data(), ctx->extradata_size);
-          std::cout << "Extradata received (" << ctx->extradata_size
+          if (dec_ctx.ctx->extradata)
+            av_freep(&dec_ctx.ctx->extradata);
+          dec_ctx.ctx->extradata_size = state.extradata_buffer.size();
+          dec_ctx.ctx->extradata = (uint8_t *)av_mallocz(
+              dec_ctx.ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+          memcpy(dec_ctx.ctx->extradata, state.extradata_buffer.data(),
+                 dec_ctx.ctx->extradata_size);
+          std::cout << "Extradata received (" << dec_ctx.ctx->extradata_size
                     << " bytes)\n";
         }
         continue;
       }
 
-      if (first_recv && type == FRAME) {
+      if (state.first_recv && type == FRAME) {
         std::cout << "First frame chunk received! Reassembling...\n";
-        first_recv = false;
+        state.first_recv = false;
       }
 
-      FrameBuffer &fb = frames[frame_id];
+      FrameBuffer &fb = state.frames[frame_id];
       if (fb.data.size() < total_packets * MAX_UDP_PAYLOAD) {
         fb.data.resize(total_packets * MAX_UDP_PAYLOAD);
       }
@@ -226,95 +261,114 @@ int main(int argc, char *argv[]) {
       fb.last_updated = std::chrono::steady_clock::now();
 
       if (fb.received_chunks == fb.total_chunks) {
-        pkt->data = fb.data.data();
-        pkt->size = fb.actual_size;
+        state.pkt->data = fb.data.data();
+        state.pkt->size = fb.actual_size;
 
-        if (avcodec_send_packet(ctx, pkt) == 0) {
-          while (avcodec_receive_frame(ctx, frame) == 0) {
-            AVFrame *target_frame = frame;
+        if (avcodec_send_packet(dec_ctx.ctx, state.pkt) == 0) {
+          while (avcodec_receive_frame(dec_ctx.ctx, state.frame) == 0) {
+            AVFrame *target_frame = state.frame;
 
-            if (frame->format == AV_PIX_FMT_CUDA) {
-              if (av_hwframe_transfer_data(sw_frame, frame, 0) == 0) {
-                target_frame = sw_frame;
+            if (state.frame->format == AV_PIX_FMT_CUDA) {
+              if (av_hwframe_transfer_data(state.sw_frame, state.frame, 0) ==
+                  0) {
+                target_frame = state.sw_frame;
               } else {
                 std::cerr << "Hardware transfer failed\n";
                 continue;
               }
             }
 
-            // match texture size on first
-            if (!texture) {
-              texture = SDL_CreateTexture(
-                  renderer, SDL_PIXELFORMAT_NV12, SDL_TEXTUREACCESS_STREAMING,
-                  target_frame->width, target_frame->height);
+            if (!disp_ctx.texture) {
+              disp_ctx.texture =
+                  SDL_CreateTexture(disp_ctx.renderer, SDL_PIXELFORMAT_NV12,
+                                    SDL_TEXTUREACCESS_STREAMING,
+                                    target_frame->width, target_frame->height);
             }
 
-            if (texture && target_frame->format == AV_PIX_FMT_NV12) {
-              // Directly upload NV12 to SDL3 (Y plane and UV plane)
-              SDL_UpdateNVTexture(texture, nullptr, target_frame->data[0],
-                                  target_frame->linesize[0],
-                                  target_frame->data[1],
-                                  target_frame->linesize[1]);
+            if (disp_ctx.texture && target_frame->format == AV_PIX_FMT_NV12) {
+              SDL_UpdateNVTexture(
+                  disp_ctx.texture, nullptr, target_frame->data[0],
+                  target_frame->linesize[0], target_frame->data[1],
+                  target_frame->linesize[1]);
 
-              SDL_RenderClear(renderer);
-              SDL_RenderTexture(renderer, texture, nullptr, nullptr);
-              SDL_RenderPresent(renderer);
+              SDL_RenderClear(disp_ctx.renderer);
+              SDL_RenderTexture(disp_ctx.renderer, disp_ctx.texture, nullptr,
+                                nullptr);
+              SDL_RenderPresent(disp_ctx.renderer);
 
-              frames_rendered++;
-              expected_frame_id = frame_id + 1; // Expect the next frame
+              state.frames_rendered++;
+              state.expected_frame_id = frame_id + 1;
 
               auto now = std::chrono::steady_clock::now();
               auto elapsed =
                   std::chrono::duration_cast<std::chrono::milliseconds>(
-                      now - stat_start_time)
+                      now - state.stat_start_time)
                       .count();
               if (elapsed >= 1000) {
-                double fps = frames_rendered * 1000.0 / elapsed;
+                double fps = state.frames_rendered * 1000.0 / elapsed;
                 std::cout << "\r[FPS: " << static_cast<int>(fps)
-                          << "] [Drops since start: " << dropped_frames
+                          << "] [Drops since start: " << state.dropped_frames
                           << "]   " << std::flush;
-                frames_rendered = 0;
-                stat_start_time = now;
+                state.frames_rendered = 0;
+                state.stat_start_time = now;
               }
             }
           }
         }
-        frames.erase(frame_id);
+        state.frames.erase(frame_id);
       }
     } else {
-      // Avoid melting the CPU if packets are not coming
       SDL_Delay(1);
     }
 
     auto now = std::chrono::steady_clock::now();
-    for (auto it = frames.begin(); it != frames.end();) {
+    for (auto it = state.frames.begin(); it != state.frames.end();) {
       if (std::chrono::duration_cast<std::chrono::milliseconds>(
               now - it->second.last_updated)
               .count() > 500) {
-        it = frames.erase(it);
+        it = state.frames.erase(it);
       } else {
         ++it;
       }
     }
   }
 
-  if (texture)
-    SDL_DestroyTexture(texture);
-  SDL_DestroyRenderer(renderer);
-  SDL_DestroyWindow(window);
-  SDL_Quit();
+  av_frame_free(&state.sw_frame);
+  av_frame_free(&state.frame);
+  av_packet_free(&state.pkt);
+}
 
-  av_frame_free(&sw_frame);
-  av_frame_free(&frame);
-  av_packet_free(&pkt);
-  avcodec_free_context(&ctx);
-  if (hw_device_ctx)
-    av_buffer_unref(&hw_device_ctx);
-#ifdef _WIN32
-  closesocket(sock);
-  WSACleanup();
-#else
-  close(sock);
-#endif
+int main(int argc, char *argv[]) {
+  int port = PORT;
+  if (argc > 1) {
+    port = std::atoi(argv[1]);
+  }
+
+  NetworkContext net_ctx;
+  if (!setup_network(port, net_ctx))
+    return 1;
+
+  DecoderContext dec_ctx;
+  if (!setup_decoder(dec_ctx)) {
+    cleanup_network(net_ctx);
+    return 1;
+  }
+
+  DisplayContext disp_ctx;
+  if (!setup_display(disp_ctx)) {
+    cleanup_decoder(dec_ctx);
+    cleanup_network(net_ctx);
+    return 1;
+  }
+
+  std::cout << "Client listening on port " << port << " for 1080p stream...\n";
+
+  StreamState state;
+  run_client_loop(net_ctx, dec_ctx, disp_ctx, state);
+
+  cleanup_display(disp_ctx);
+  cleanup_decoder(dec_ctx);
+  cleanup_network(net_ctx);
+
   return 0;
 }
